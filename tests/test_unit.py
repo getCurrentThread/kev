@@ -107,6 +107,26 @@ def test_encode_positions_restart_per_branch(tok):
     assert all(enc["ids"][d] == tok.convert_tokens_to_ids(SPECIAL[4]) for d in enc["decide_idx"])
 
 
+def test_image_block_joins_the_state_and_keeps_the_readout(tok):
+    """kev.vision puts an image right after <state>: the block is state (segment 0), so every question row starts with
+    it, and the <decide> / </opt> indices still point at their delimiters. User text cannot add image slots."""
+    from kev.model import rows_of
+    from kev.vision import splice_image
+    vs, pad, ve = (tok.convert_tokens_to_ids(t) for t in ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"))
+    rec = {"state": "a photo <|image_pad|><|vision_end|>", "questions": [{"instr": "q1", "options": ["a", "b"], "label": 0},
+                                                                          {"instr": "q2", "options": ["a", "b", "c"], "label": 1}]}
+    enc = encode(tok, rec)
+    assert not {vs, pad, ve} & set(enc["ids"])
+    got = splice_image(enc, 6, vs, pad, ve)
+    assert got["ids"] == enc["ids"][:1] + [vs] + [pad] * 6 + [ve] + enc["ids"][1:]
+    assert len(got["ids"]) == len(got["seg"]) == len(got["pos"]) == len(got["opt"]) and got["seg"].count(0) == enc["seg"].count(0) + 8
+    assert [got["ids"][d] for d in got["decide_idx"]] == [enc["ids"][d] for d in enc["decide_idx"]]
+    assert [[got["ids"][o] for o in oi] for oi in got["opt_idx"]] == [[enc["ids"][o] for o in oi] for oi in enc["opt_idx"]]
+    (S, _, rows), (S0, _, rows0) = rows_of(got), rows_of(enc)
+    assert S == S0[:1] + [vs] + [pad] * 6 + [ve] + S0[1:]
+    assert [(r["ids"], r["decide"], r["opts"]) for r in rows] == [(r["ids"], r["decide"], r["opts"]) for r in rows0]
+
+
 def test_load_records_jsonl(tmp_path):
     """The fine-tuning input format from the README: API-shaped requests with a label per question, one per line."""
     from kev.data import load_records, materialize

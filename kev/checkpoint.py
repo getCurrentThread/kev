@@ -8,6 +8,7 @@ import the data or suite modules at import time.
     ck = Checkpoint("jaredpalmer/kev-4b")          # or a local run directory; `@tag` pins a Hub revision
     tok, model = ck.load("mps", LoadOptions.from_env())
     ck.meta.temperature                             # the calibration the checkpoint carries
+    tok, model = ck.load_vision("cuda")             # the same checkpoint with an image in the state (kev.vision)
 """
 import datetime
 import json
@@ -165,12 +166,23 @@ class Checkpoint:
     def load(self, device, opts=LoadOptions()):
         """-> (tokenizer, model) in eval mode with the LoRA applied and the pointer head loaded. The model is a
         DecisionModel (torch) or an MLXDecisionModel (backend mlx); both expose the same scoring interface."""
-        meta = self.meta
-        tok = load_tokenizer(meta.base, revision=meta.base_revision)
+        tok = load_tokenizer(self.meta.base, revision=self.meta.base_revision)
         m = self._load_mlx(tok, opts) if self.backend(device, opts) == "mlx" else self._load_torch(tok, device, opts)
-        m.head.load_state_dict(meta.head); m.eval()
-        m.head.temperature = meta.temperature if opts.temperature is None else opts.temperature
-        return tok, m
+        return tok, self._with_head(m, opts)
+
+    def load_vision(self, device, opts=LoadOptions()):
+        """-> (tokenizer, kev.vision.VisionDecisionModel): the same adapter and pointer head on the language model inside
+        the base's vision-language model, so a record's state can start with an image. Torch only (the MLX backend loads
+        mlx-lm's text model); "auto" resolves to torch."""
+        from .vision import VisionDecisionModel   # lazy: the Space vendors this module without kev/vision.py
+        if opts.backend == "mlx": raise ValueError("images run on the torch backend")
+        tok = load_tokenizer(self.meta.base, revision=self.meta.base_revision)
+        return tok, self._with_head(self._load_torch(tok, device, opts, cls=VisionDecisionModel), opts)
+
+    def _with_head(self, m, opts):
+        m.head.load_state_dict(self.meta.head); m.eval()
+        m.head.temperature = self.meta.temperature if opts.temperature is None else opts.temperature
+        return m
 
     def _load_mlx(self, tok, opts):
         from .mlx_model import MLXDecisionModel, merge_lora
@@ -182,7 +194,7 @@ class Checkpoint:
         merge_lora(m.lm, self.path, opts.lora_scale)
         return m
 
-    def _load_torch(self, tok, device, opts):
+    def _load_torch(self, tok, device, opts, cls=DecisionModel):
         from peft import PeftModel
         meta = self.meta
         dtype, merge = opts.dtype or torch.float32, opts.merge
@@ -191,8 +203,8 @@ class Checkpoint:
             # the same way and keep the fp32 adapter unmerged rather than folding it into bf16 weights.
             dtype, merge = torch.bfloat16, False
         merge = merge and not self.adapter_config().get("trainable_token_indices")   # token-trained adapters stay unmerged
-        m = DecisionModel(meta.base, tok, device, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
-                          option_isolation=meta.option_isolation, dtype=torch.float32 if merge else dtype, attn=opts.attn)
+        m = cls(meta.base, tok, device, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
+                option_isolation=meta.option_isolation, dtype=torch.float32 if merge else dtype, attn=opts.attn)
         m.lm = PeftModel.from_pretrained(m.lm, self.path, torch_device=str(device)).to(device)   # trainable token embeddings, if any, live in the adapter
         if opts.lora_scale != 1:
             for module in m.lm.modules():
