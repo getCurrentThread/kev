@@ -166,23 +166,12 @@ class Checkpoint:
     def load(self, device, opts=LoadOptions()):
         """-> (tokenizer, model) in eval mode with the LoRA applied and the pointer head loaded. The model is a
         DecisionModel (torch) or an MLXDecisionModel (backend mlx); both expose the same scoring interface."""
-        tok = load_tokenizer(self.meta.base, revision=self.meta.base_revision)
+        meta = self.meta
+        tok = load_tokenizer(meta.base, revision=meta.base_revision)
         m = self._load_mlx(tok, opts) if self.backend(device, opts) == "mlx" else self._load_torch(tok, device, opts)
-        return tok, self._with_head(m, opts)
-
-    def load_vision(self, device, opts=LoadOptions()):
-        """-> (tokenizer, kev.vision.VisionDecisionModel): the same adapter and pointer head on the language model inside
-        the base's vision-language model, so a record's state can start with an image. Torch only (the MLX backend loads
-        mlx-lm's text model); "auto" resolves to torch."""
-        from .vision import VisionDecisionModel   # lazy: the Space vendors this module without kev/vision.py
-        if opts.backend == "mlx": raise ValueError("images run on the torch backend")
-        tok = load_tokenizer(self.meta.base, revision=self.meta.base_revision)
-        return tok, self._with_head(self._load_torch(tok, device, opts, cls=VisionDecisionModel), opts)
-
-    def _with_head(self, m, opts):
-        m.head.load_state_dict(self.meta.head); m.eval()
-        m.head.temperature = self.meta.temperature if opts.temperature is None else opts.temperature
-        return m
+        m.head.load_state_dict(meta.head); m.eval()
+        m.head.temperature = meta.temperature if opts.temperature is None else opts.temperature
+        return tok, m
 
     def _load_mlx(self, tok, opts):
         from .mlx_model import MLXDecisionModel, merge_lora
@@ -214,6 +203,19 @@ class Checkpoint:
         if merge: m.lm = m.lm.merge_and_unload()     # in fp32: exact
         if dtype != torch.float32: m.lm = m.lm.to(dtype)
         return m
+
+    def load_vision(self, device, opts=LoadOptions()):
+        """-> (tokenizer, kev.vision.VisionDecisionModel) in eval mode: the same adapter and pointer head on the language
+        model inside the base's vision-language model, so a record's state can start with an image. Torch only: "auto"
+        resolves to torch, any other backend is refused (MLX loads mlx-lm's text model)."""
+        from .vision import VisionDecisionModel   # lazy: the Space vendors this module without kev/vision.py
+        if opts.backend not in (None, "torch", "auto"): raise ValueError(f"images run on the torch backend, not {opts.backend!r}")
+        meta = self.meta
+        tok = load_tokenizer(meta.base, revision=meta.base_revision)
+        m = self._load_torch(tok, device, opts, cls=VisionDecisionModel)
+        m.head.load_state_dict(meta.head); m.eval()
+        m.head.temperature = meta.temperature if opts.temperature is None else opts.temperature
+        return tok, m
 
     COMPAT_FIELDS = ("base", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings")
 

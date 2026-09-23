@@ -160,12 +160,14 @@ def test_vision_load_without_an_image_matches_load():
     """load_vision puts the released Kev-0.8B adapter on the language model inside Qwen3.5-0.8B-Base's vision-language
     model. That is the module load() builds on its own, so a record without an image must score the same."""
     import torch
-    from kev.checkpoint import Checkpoint
+    from kev.checkpoint import Checkpoint, LoadOptions
     ck = Checkpoint("jaredpalmer/kev-0.8b")
     tok, text = ck.load("cpu"); _, vision = ck.load_vision("cpu")
     with torch.no_grad():
         a, b = torch.cat(text.probs(text.encode(tok, SUPPORT))), torch.cat(vision.probs(vision.encode(tok, SUPPORT)))
     assert (a - b).abs().max() < 1e-5, (a, b)
+    with pytest.raises(ValueError):                           # images need the torch backend; refused, not silently torch
+        ck.load_vision("cpu", LoadOptions(backend="mlx"))
 
 
 def test_vision_rows_match_the_base_forward_and_stay_isolated(monkeypatch):

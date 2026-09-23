@@ -119,23 +119,6 @@ There's a [chess demo](http://localhost:3001/chess), too. The board is the input
 
 ![Kev chess](docs/chess.png)
 
-### Images
-
-The Qwen3.5 bases are vision-language models, and a checkpoint's adapter only touches their language model. `load_vision` loads the base with its vision tower, so the state can start with a picture:
-
-```python
-from PIL import Image
-from kev.checkpoint import Checkpoint
-from kev.model import SERVE_MAX_BRANCH, SERVE_MAX_STATE
-
-tok, model = Checkpoint("jaredpalmer/kev-4b").load_vision("cuda")
-record = {"state": "", "questions": [{"instr": "Which room is this?", "options": ["kitchen", "bedroom", "office"], "label": 0}]}
-enc = model.encode(tok, record, image=Image.open("room.jpg"), max_state=SERVE_MAX_STATE, max_branch=SERVE_MAX_BRANCH)
-print(model.probs(enc)[0])
-```
-
-A picture becomes about one token per 1,024 pixels, at least 64 (the processor scales smaller pictures up) and at most 1,024 (`kev.vision.MAX_IMAGE_PIXELS`), on top of the state text. No Kev checkpoint was trained on images, and the temperature each checkpoint carries was fitted on text, so check accuracy and confidence on your own data. It runs in Python only: the server, the prefix cache and the MLX backend don't take images.
-
 ## Models
 
 Start with Kev-4B. Use Kev-9B when accuracy and calibration matter more than memory. Use Kev-0.8B if you need the smallest model. All three are built on Qwen3.5 bases with the same training data and settings.
@@ -235,6 +218,24 @@ The pointer head scores each option's `</opt>` hidden state against the question
 Training uses cross-entropy on the correct answer. The adapter and head are trained together; the rest of the base weights stay fixed. Training examples and API requests use the same text format. No Jev outputs were used for training.
 
 Asking questions together or separately produces probabilities within 4e-6 in the fp32 tests. This does **not** mean option order is irrelevant: options within a question can still affect one another. See [the model code](kev/model.py) and [parity tests](tests/test_model.py).
+
+### Images
+
+The Qwen3.5 bases are vision-language models, and a checkpoint's adapter only touches their language model. `Checkpoint.load_vision` loads the base with its vision tower, so the state can start with a picture (the image processor needs Pillow, which `uv sync` installs; with pip, `pip install pillow`):
+
+```python
+from PIL import Image, ImageOps
+from kev.checkpoint import Checkpoint
+from kev.model import SERVE_MAX_BRANCH, SERVE_MAX_STATE
+
+tok, model = Checkpoint("jaredpalmer/kev-4b").load_vision("cuda")
+record = {"state": "", "questions": [{"instr": "Which room is this?", "options": ["kitchen", "bedroom", "office"], "label": 0}]}
+image = ImageOps.exif_transpose(Image.open("room.jpg"))   # phone photos store their rotation in EXIF
+enc = model.encode(tok, record, image=image, max_state=SERVE_MAX_STATE, max_branch=SERVE_MAX_BRANCH)
+print(model.probs(enc)[0])
+```
+
+A picture becomes about one token per 1,024 pixels, at least 64 and at most 1,024 (`kev.vision.MAX_IMAGE_PIXELS`), on top of the state text. No Kev checkpoint was trained on images, and the temperature each checkpoint carries was fitted on text, so check accuracy and confidence on your own data. It runs in Python only: the server, the prefix cache and the MLX backend don't take images.
 
 ## Serving Performance
 
