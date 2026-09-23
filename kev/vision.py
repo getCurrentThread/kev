@@ -14,17 +14,18 @@ takes DecisionModel's path unchanged.
 
     tok, m = Checkpoint("jaredpalmer/kev-4b").load_vision("cuda", LoadOptions(dtype=torch.bfloat16))
     enc = m.encode(tok, {"state": "", "questions": [{"instr": "What is on the table?", "options": ["a cup", "a book"], "label": 0}]},
-                   image=Image.open("photo.jpg"), max_state=SERVE_MAX_STATE, max_branch=SERVE_MAX_BRANCH)
+                   image=ImageOps.exif_transpose(Image.open("photo.jpg")), max_state=SERVE_MAX_STATE, max_branch=SERVE_MAX_BRANCH)
     probs = m.probs(enc)                            # one tensor per question
 
 No checkpoint was trained with images: this reuses the base's image understanding through an adapter that only saw text,
 and the temperature in head.pt was fitted on text states. An image becomes about pixels / 1,024 tokens (each side rounded
 to a multiple of 32; at least 64, the processor scales small pictures up) on top of max_state. `m.processor.size`
 ({"shortest_edge", "longest_edge"} in total pixels) sets the bounds, capped here at MAX_IMAGE_PIXELS. The image processor
-needs Pillow.
+is transformers' Pillow backend, so it needs Pillow and not torchvision, and it does not apply EXIF orientation.
 """
 import torch
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoModel
+from transformers.models.auto.image_processing_auto import AutoImageProcessor   # the top-level name requires torchvision
 
 from .model import OPT_NONE, DecisionModel, rows_of
 
@@ -53,7 +54,7 @@ class VisionDecisionModel(DecisionModel):
         cfg = self.vlm.config
         self.image_pad, self.vision_start, self.vision_end = cfg.image_token_id, cfg.vision_start_token_id, cfg.vision_end_token_id
         self.spatial_merge = cfg.vision_config.spatial_merge_size
-        self.processor = AutoImageProcessor.from_pretrained(name, revision=revision)
+        self.processor = AutoImageProcessor.from_pretrained(name, revision=revision, backend="pil")   # same pixels with or without torchvision
         size = self.processor.size
         self.processor.size = {"shortest_edge": size.shortest_edge, "longest_edge": min(size.longest_edge, MAX_IMAGE_PIXELS)}
 
