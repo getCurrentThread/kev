@@ -44,10 +44,10 @@ RANGES = {"epochs": (1, 5), "seed": (0, 10000), "lr": (1e-6, 0.001), "lora": (1,
           "label_smoothing": (0, 0.2), "brier_w": (0, 2), "focal_gamma": (0, 4),
           "p_none": (0, 0.4), "p_none_distract": (0, 0.4), "p_distract": (0, 0.4), "p_none_pair": (0, 1), "synthetic_repeat": (1, 6), "public_frac": (0.05, 1.0), "head_lr": (0, 0.01), "weight_decay": (0, 0.3), "anchor_w": (0, 5)}
 CHOICES = {"dtype": ("fp32", "bf16"), "checkpointing": (0, 1), "option_isolation": (0, 1), "special_embeddings": (0, 1), "head_dim": (128, 256, 512, 1024),
-           "lora_targets": ("all", "dense", "attn", "qv"), "weights_dtype": ("fp32", "bf16"), "full_ft": (0, 1), "length_sort": (0, 1)}
-CHOICE_DEFAULTS = {"dtype": "fp32", "checkpointing": 0, "option_isolation": 0, "special_embeddings": 0, "head_dim": 256, "lora_targets": "all", "weights_dtype": "fp32", "full_ft": 0, "length_sort": 0}   # kev.train's defaults for the categorical knobs
+           "lora_targets": ("all", "dense", "attn", "qv"), "weights_dtype": ("fp32", "bf16"), "full_ft": (0, 1), "length_sort": (0, 1), "shared_prefix": (0, 1)}
+CHOICE_DEFAULTS = {"dtype": "fp32", "checkpointing": 0, "option_isolation": 0, "special_embeddings": 0, "head_dim": 256, "lora_targets": "all", "weights_dtype": "fp32", "full_ft": 0, "length_sort": 0, "shared_prefix": None}   # kev.train's defaults for the categorical knobs (shared_prefix: on with full_ft)
 # optional integer knobs, passed to kev.train only when a trial sets them (so existing plans keep their config hashes)
-OPTIONAL_INTS = {"max_state": (MAX_STATE, MAX_TRAIN_STATE), "row_budget": (0, 65536), "max_steps": (0, 100000)}
+OPTIONAL_INTS = {"max_state": (MAX_STATE, MAX_TRAIN_STATE), "row_budget": (0, 65536), "max_steps": (0, 100000), "save_every_steps": (0, 100000)}
 
 
 def validated_trial(value, manifest):
@@ -56,6 +56,8 @@ def validated_trial(value, manifest):
     result = {**DEFAULTS, **value}
     if result.get("full_ft") and result.get("weights_dtype") != "bf16":
         raise ValueError("full_ft trains bf16 weights: set weights_dtype bf16")
+    if result.get("save_every_steps") and not result.get("full_ft"):
+        raise ValueError("save_every_steps writes resume points, which are for full_ft trials")
     if "data" in result and not re.fullmatch(r"evals/[\w./-]+\.jsonl", str(result["data"])):
         raise ValueError("data must be a .jsonl under evals/ (shipped with the image, hashed in provenance)")
     if "replay" in result and (not isinstance(result["replay"], int) or not 0 <= result["replay"] <= 20000 or "data" not in result):
@@ -96,6 +98,9 @@ def validated_trial(value, manifest):
         raise ValueError("a trial may change only one loss modifier")
     return result
 
+
+RESUME_MINUTES = 60   # full-weight trials: minutes between resume points (kev.train --save_every_minutes). A 27B's on 8 H200s
+# (~307 GB) blocked training 23 s and wrote in ~2.5 min behind it, slowing those steps ~50 %: ~2.6 % of an hour (runs/sft-probe/sft2-27b-8xh200-all-balanced)
 
 # files whose change would alter what a score means; trainer/runner files may differ when resuming an interrupted evaluation
 EVALUATOR_FILES = {f"kev/{n}" for n in ("model.py", "benchmark.py", "data.py", "api.py", "suite.py", "evaluate.py", "contrastive.py", "composition.py", "study_v3.py")}
@@ -222,8 +227,28 @@ def resume_trial(suite, output, expected_sources, device, transfer_suite=None):
     return score_trial(str(output / "checkpoint"), suite, output, expected_sources, device, provenance, transfer_suite, time.perf_counter(), legacy=False)
 
 
+def continue_trial(suite, output, expected_sources, device, transfer_suite=None):
+    """Continue an interrupted full-weight trial (its container timed out or was lost) from the last resume point the
+    trainer wrote (or from its start if it wrote none), then score it; a trial whose training had finished is only scored. Refuses unless the code is the trial's own: a
+    continuation is only the same run when the trainer is the same."""
+    output = Path(output)
+    provenance = read_json(output / "provenance.json")
+    if (output / "result.json").exists() or not provenance["config"].get("full_ft"):
+        raise ValueError("only an unfinished full-weight trial continues")
+    if provenance["source_hashes"] != expected_sources or source_hashes() != expected_sources:
+        raise ValueError("continue refused: the code differs from the interrupted trial's")
+    provenance.setdefault("continued", []).append({"git_commit": git_commit(), "device": device})
+    write_json(output / "provenance.json", provenance)
+    started = time.perf_counter()
+    finished = (output / "checkpoint" / "head.pt").exists()   # the attempt ran out of time while scoring: score again
+    run = str(output / "checkpoint") if finished else train_checkpoint(provenance["config"], suite, output, device)
+    return score_trial(run, suite, output, expected_sources, device, provenance, transfer_suite, started, legacy=False)
+
+
 def train_checkpoint(config, suite, output, device):
-    """Run kev.train as a subprocess on the suite's training partition; train.log is the record, stdout gets progress."""
+    """Run kev.train as a subprocess on the suite's training partition; train.log is the record (appended to when a
+    full-weight trial continues), stdout gets progress. A full-weight trial writes a resume point every RESUME_MINUTES and
+    starts with --resume 1, so a second call continues where the first stopped."""
     run = str(Path(output) / "checkpoint")
     # a full-weight trial uses every GPU of its container: FSDP2 ranks under torchrun (kev.full_ft); one GPU runs plainly
     gpus = torch.cuda.device_count() if config.get("full_ft") and device == "cuda" else 1
@@ -231,7 +256,8 @@ def train_checkpoint(config, suite, output, device):
     args = [sys.executable, *launcher, "-m", "kev.train", "--suite", str(suite), "--out", run, "--device", device]
     for key, value in config.items():
         args += ["--" + key, str(value)]
-    with (Path(output) / "train.log").open("w", encoding=ENCODING) as log, subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=ROOT) as proc:
+    if config.get("full_ft"): args += ["--resume", "1", "--save_every_minutes", str(RESUME_MINUTES)]
+    with (Path(output) / "train.log").open("a", encoding=ENCODING) as log, subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=ROOT) as proc:
         for line in proc.stdout:
             log.write(line); log.flush()
             if line.startswith(("ep", "saved", "device", "ablation")) or "Error" in line: print(line.rstrip(), flush=True)
@@ -356,7 +382,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--aggregate", action="store_true", help="rank an existing study directory (e.g. after Modal trials)")
     ap.add_argument("--transfer", help="eval-only suite whose development partition is scored for every trial (out-of-domain check)")
-    ap.add_argument("--resume", action="store_true", help="finish evaluation for trials in --out that have a checkpoint but no result.json (interrupted studies)")
+    ap.add_argument("--resume", action="store_true", help="finish evaluation for trials in --out that have a checkpoint but no result.json, and continue "
+                                                         "unfinished full-weight trials from their last resume point (interrupted studies)")
     a = ap.parse_args()
     if a.aggregate:
         aggregate(a.out); return
@@ -364,9 +391,14 @@ def main():
         if not a.suite: ap.error("--suite is required with --resume")
         suite = Path(a.suite).resolve()
         for directory in sorted(Path(a.out).iterdir()):
-            if (directory / "checkpoint" / "head.pt").exists() and not (directory / "result.json").exists():
+            if (directory / "result.json").exists() or not (directory / "provenance.json").exists(): continue
+            transfer = Path(a.transfer).resolve() if a.transfer else None
+            if (directory / "checkpoint" / "head.pt").exists():
                 print(f"Resuming evaluation for {directory.name}", flush=True)
-                resume_trial(suite, directory, source_hashes(), a.device, Path(a.transfer).resolve() if a.transfer else None)
+                resume_trial(suite, directory, source_hashes(), a.device, transfer)
+            elif read_json(directory / "provenance.json")["config"].get("full_ft"):
+                print(f"Continuing training for {directory.name}", flush=True)
+                continue_trial(suite, directory, source_hashes(), a.device, transfer)
         if (Path(a.out) / "results.jsonl").exists(): (Path(a.out) / "results.jsonl").unlink()
         aggregate(a.out); return
     if not a.plan or not a.suite:

@@ -78,8 +78,11 @@ class VisionDecisionModel(DecisionModel):
         return {**splice_image(enc, n, self.vision_start, self.image_pad, self.vision_end),
                 "pixel_values": pix["pixel_values"], "image_grid_thw": pix["image_grid_thw"]}
 
-    def forward_rows_batch(self, encs):
-        if not any("image_grid_thw" in e for e in encs): return super().forward_rows_batch(encs)
+    def forward_rows_batch(self, encs, shared_prefix=False):
+        """DecisionModel.forward_rows_batch, with each image record through _image_rows. shared_prefix (training) runs the
+        backbone on token ids alone (kev.shared_prefix), so it is refused for image records rather than dropping the picture."""
+        if not any("image_grid_thw" in e for e in encs): return super().forward_rows_batch(encs, shared_prefix)
+        if shared_prefix: raise NotImplementedError("shared_prefix does not carry images; image records run the row form")
         return [self._image_rows(e) if "image_grid_thw" in e else super().forward_rows_batch([e])[0] for e in encs]
 
     def _image_rows(self, enc):

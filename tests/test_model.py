@@ -158,6 +158,58 @@ def test_hybrid_rows_isolation_and_prefix():
         assert (a - b).abs().max() < 1e-4 and (a - c).abs().max() < 1e-4 and (a - d).abs().max() < 1e-4 and (a - e).abs().max() < 1e-4 and (a - f).abs().max() < 1e-4
 
 
+@pytest.mark.parametrize("device,dtype", [("cpu", "float32"), ("cuda", "float32"), ("cuda", "bfloat16")])
+def test_shared_prefix_matches_rows(device, dtype):
+    """kev.shared_prefix on Qwen3.5-0.8B-Base, gradient checkpointing on: over records with 1-4 questions and states of
+    unequal length (so states are left-padded), the logits and every parameter's gradient equal the row form's, as closely
+    as the row form agrees with itself when only the batch changes (the same records one at a time). On CUDA (run it on
+    Modal, modal_app.py::gpu_tests) fla's Triton kernels differentiate through the prefix's `initial_state` and their fp32
+    dots round like TF32, so that noise is measured, not assumed; on the CPU transformers' reference kernels are exact to
+    fp32 and the floor applies."""
+    import importlib.util
+    import torch
+    from kev.data import materialize
+    from kev.model import DecisionModel, load_tokenizer
+    from kev.suite import load_split
+    if device == "cuda" and not torch.cuda.is_available(): pytest.skip("needs CUDA")
+    if device == "cpu" and importlib.util.find_spec("causal_conv1d"): pytest.skip("transformers sends CPU tensors to causal-conv1d's CUDA kernel when it is installed")
+    tok = load_tokenizer("Qwen/Qwen3.5-0.8B-Base")
+    m = DecisionModel("Qwen/Qwen3.5-0.8B-Base", tok, device, dtype=getattr(torch, dtype)).train()
+    m.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    dev = load_split("evals/v7/decision-v7", "development")
+    recs = [materialize(r) for r in dev if len(r["questions"]) > 1][:2] + [materialize(dev[0])]
+    long = materialize(dev[5]); long["state"] = " ".join(materialize(r)["state"] for r in dev[:20])
+    long["questions"] = [q for r in recs for q in r["questions"]][:4]
+    encs = [m.encode(tok, r) for r in [*recs, long]]
+
+    def run(shared, batches):
+        m.zero_grad(); logits = []
+        for batch in batches:
+            zs = [z for zz in m.forward_batch(batch, shared) for z in zz]
+            sum(torch.log_softmax(z.float(), -1)[(len(logits) + i) % len(z)] for i, z in enumerate(zs)).backward(); logits += zs
+        return torch.cat(logits).float().detach(), {n: p.grad.float().clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    (rows, g_rows), (alone, g_alone), (prefix, g_prefix) = run(False, [encs]), run(False, [[e] for e in encs]), run(True, [encs])
+    big = [k for k in g_rows if g_rows[k].norm() > 1e-3 * max(g.norm() for g in g_rows.values())]
+    rel = lambda g: max(float((g_rows[k] - g[k]).norm() / g_rows[k].norm()) for k in big)
+    noise, diff = (float((rows - alone).abs().max()), rel(g_alone)), (float((rows - prefix).abs().max()), rel(g_prefix))
+    print(f"{device} {dtype}: max |logit diff| rows vs rows one record at a time {noise[0]:.2e}, rows vs shared prefix {diff[0]:.2e}; "
+          f"worst relative gradient diff {noise[1]:.2e} vs {diff[1]:.2e}")
+    assert g_rows.keys() == g_prefix.keys() and diff[0] <= max(3e-4, 3 * noise[0]) and diff[1] <= max(1e-3, 3 * noise[1])
+    # Magnitudes alone would let a small systematic shift pass as noise. Signed checks: (1) the shared prefix is as close
+    # to the second batching of the row form as to the first; (2) the mean signed logit difference sits within the
+    # batching noise's own mean plus 3 standard errors; (3) the gradient difference along the gradient itself (a
+    # systematic scaling) is no larger than the batching's and well under the whole difference's size.
+    assert float((alone - prefix).abs().max()) <= max(3e-4, 3 * noise[0])
+    d_noise, d_prefix = alone - rows, prefix - rows
+    bias_bound = float(d_noise.mean().abs() + 3 * d_noise.std() / len(d_noise) ** 0.5) + 3e-5   # floor: a tenth of the magnitude floor
+    flat = lambda g: torch.cat([g[k].flatten() for k in big])
+    along = lambda g: float(torch.dot(flat(g) - flat(g_rows), flat(g_rows)) / flat(g_rows).square().sum())
+    print(f"  mean signed logit diff {float(d_prefix.mean()):+.2e} (bound {bias_bound:.2e}); gradient shift along itself {along(g_prefix):+.2e} (batching {along(g_alone):+.2e})")
+    assert float(d_prefix.mean().abs()) <= bias_bound
+    assert abs(along(g_prefix)) <= max(1e-4, 3 * abs(along(g_alone)), 0.3 * noise[1])
+
+
 SUPPORT = {"state": "Order 4411 arrived late and the box was crushed. Two charges appear on the card.",
            "questions": [{"instr": "Is there a billing problem?", "options": ["yes", "no"], "label": 0},
                          {"instr": "Which team should handle this?", "options": ["returns", "shipping", "billing", "other"], "label": 2}]}
@@ -215,6 +267,8 @@ def test_vision_rows_match_the_base_forward_and_stay_isolated(monkeypatch):
     assert any((a - t).abs().max() > 1e-3 for a, t in zip(together, text_only)), "the image must reach the rows"
     with pytest.raises(NotImplementedError):
         m.probs_and_prefix(enc)
+    with pytest.raises(NotImplementedError):                  # kev.shared_prefix runs token ids: it would drop the image
+        m.forward_batch([enc], True)
     with pytest.raises(ValueError):
         m.encode(tok, SUPPORT, image=[picture(), picture()])
 

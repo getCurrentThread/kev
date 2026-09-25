@@ -439,9 +439,11 @@ def test_master_adamw_is_adamw_on_fp32_masters():
     assert all(torch.equal(p, opt_low.state[p]["master"].to(torch.bfloat16)) for p in low)
 
 
-def test_row_budget_changes_passes_not_gradients(tiny_base):
+@pytest.mark.parametrize("shared", [0, 1])
+def test_row_budget_changes_passes_not_gradients(tiny_base, shared):
     """--row_budget splits a micro-batch into forward/backward passes (here every record by question, each part carrying
-    half of its record's mean); the accumulated gradient equals the single pass's."""
+    half of its record's mean); the accumulated gradient equals the single pass's, in the row form and through a shared
+    prefix (whose pass cost counts the state once)."""
     import contextlib
     from kev.data import load_records
     from kev.model import MAX_STATE, load_tokenizer
@@ -450,17 +452,81 @@ def test_row_budget_changes_passes_not_gradients(tiny_base):
     model = DecisionModel(str(tiny_base / "base"), tok, "cpu"); model.train()
     reqs = load_records(tiny_base / "data.jsonl")[:4]
     knobs = dict(seed=0, p_none=0.0, p_none_distract=0.0, p_distract=0.0, p_none_pair=0.0, perm_kl=0.0, perm_frac=0.0, max_state=MAX_STATE,
-                 ord_w=0.0, label_smoothing=0.0, brier_w=0.0, focal_gamma=0.0, anchor_w=0.0)
+                 ord_w=0.0, label_smoothing=0.0, brier_w=0.0, focal_gamma=0.0, anchor_w=0.0, shared_prefix=shared)
     grads, sizes = [], []
     for budget in (0, 16):
         a = SimpleNamespace(**knobs, row_budget=budget)
         batch = encode_batch(model, tok, a, reqs, 0); model.zero_grad()
-        passes = row_passes(batch, budget)
+        passes = row_passes(batch, budget, shared)
         for part in passes:
             batch_loss(model, a, part, "cpu", {}, None, contextlib.nullcontext())[0].backward()
         grads.append([p.grad.clone() for p in model.parameters() if p.grad is not None]); sizes.append((len(batch), len(passes), sum(v.share for v in batch)))
     assert sizes == [(4, 1, 4.0), (8, 8, 4.0)]
-    assert all(torch.allclose(a, b, atol=1e-6) for a, b in zip(*grads))
+    scale = max(g.abs().max() for g in grads[0])
+    assert all(torch.allclose(a, b, atol=1e-5 * scale) for a, b in zip(*grads))   # fp32 summation order (the shared prefix pads states differently per pass)
+
+
+@pytest.mark.parametrize("checkpointing,lora", [(False, 0), (True, 0), (True, 4)])
+def test_shared_prefix_equals_rows(tiny_base, checkpointing, lora):
+    """kev.shared_prefix (each state once, branches continuing from it: attention keys and values, the DeltaNet conv
+    window and recurrent state) gives the row form's logits and gradients in fp32, over states of unequal length (left
+    padding) and 1-4 questions; with gradient checkpointing each layer's two passes are recomputed together. With a LoRA
+    (kev.train --shared_prefix 1 without --full_ft) the same holds for the adapter's gradients (dropout off: eval mode,
+    so the two passes draw no different masks)."""
+    import random
+    from kev.model import load_tokenizer
+    tok, rng = load_tokenizer(str(tiny_base / "base")), random.Random(0)
+    words = "it is charged twice which team billing shipping refund angry the customer".split()
+    text = lambda n: " ".join(rng.choice(words) for _ in range(n))
+    recs = [{"state": text(n), "questions": [{"instr": text(rng.randint(1, 5)), "options": [text(rng.randint(1, 3)) for _ in range(rng.randint(2, 4))], "label": 0}
+                                              for _ in range(q)]} for n, q in ((5, 3), (17, 4), (1, 2), (40, 1))]
+    torch.manual_seed(0)
+    model = DecisionModel(str(tiny_base / "base"), tok, "cpu", lora=lora or None)
+    model.train(not lora)
+    if checkpointing: model.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    encs, results = [model.encode(tok, r) for r in recs], []
+    for shared in (False, True):
+        model.zero_grad()
+        logits = [z for zs in model.forward_batch(encs, shared) for z in zs]
+        sum(torch.log_softmax(z, -1)[0] * (i + 1) for i, z in enumerate(logits)).backward()
+        results.append((torch.cat(logits).detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}))
+    (rows, g_rows), (prefix, g_prefix) = results
+    scale = max(g.abs().max() for g in g_rows.values())
+    assert len(logits) == 10 and torch.allclose(rows, prefix, atol=1e-5) and g_rows.keys() == g_prefix.keys()
+    assert all(torch.allclose(g_rows[k], g_prefix[k], atol=1e-5 * scale) for k in g_rows)
+    assert not lora or any("lora_" in k for k in g_rows)
+
+
+# torchrun on this machine only, by address: --standalone resolves the hostname, which hangs where it has no DNS entry
+LOCAL_RENDEZVOUS = ("--nnodes=1", "--rdzv-backend=c10d", "--rdzv-endpoint=127.0.0.1:0", "--local-addr=127.0.0.1")
+
+
+def _run_train(args, out, ranks=1):
+    import subprocess, sys
+    launcher = ["-m", "torch.distributed.run", *LOCAL_RENDEZVOUS, f"--nproc_per_node={ranks}"] if ranks > 1 else []
+    subprocess.run([sys.executable, *launcher, "-m", "kev.train", *args, "--out", str(out)], check=True, capture_output=True)
+
+
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_resume_is_bit_identical(tiny_base, tmp_path, ranks):
+    """A full-weight run that stops after step 3 (its resume point: fp32 masters and moments, scheduler, RNG, data
+    position) and continues with --resume 1 ends with the same bits as an uninterrupted run, across an epoch boundary,
+    on one process and on two FSDP2 ranks."""
+    from safetensors.torch import load_file
+    from kev.checkpoint import read_meta
+    args = ["--base", str(tiny_base / "base"), "--data", str(tiny_base / "data.jsonl"), "--device", "cpu", "--batch", "2", "--accum", str(2 // ranks),
+            "--lr", "1e-3", "--epochs", "2", "--p_none_pair", "0.5", "--length_sort", "1", *FULL]
+    _run_train(args, tmp_path / "whole", ranks)
+    _run_train([*args, "--save_every_steps", "3", "--stop_after", "3"], tmp_path / "split", ranks)
+    assert (tmp_path / "split/resume/latest.json").exists() and not (tmp_path / "split/model.safetensors").exists()
+    _run_train([*args, "--resume", "1"], tmp_path / "split", ranks)
+    a, b = load_file(tmp_path / "whole/model.safetensors"), load_file(tmp_path / "split/model.safetensors")
+    head_a, head_b = read_meta(tmp_path / "whole").head, read_meta(tmp_path / "split").head
+    assert all(torch.equal(a[k], b[k]) for k in a) and all(torch.equal(head_a[k], head_b[k]) for k in head_a)
+    assert not (tmp_path / "split/resume").exists()   # the finished checkpoint supersedes the resume point
+    from kev.suite import read_json
+    norms = [read_json(tmp_path / d / "training_metrics.json")["grad_norm"] for d in ("whole", "split")]
+    assert norms[0] == norms[1] and [e["epoch"] for e in norms[0]] == [0, 1]   # carried across the resume point
 
 
 def test_fsdp2_ranks_train_what_one_process_trains(tiny_base, tmp_path):
@@ -471,7 +537,7 @@ def test_fsdp2_ranks_train_what_one_process_trains(tiny_base, tmp_path):
     common = ["-m", "kev.train", "--base", str(tiny_base / "base"), "--data", str(tiny_base / "data.jsonl"), "--device", "cpu", "--batch", "2",
               "--lr", "1e-3", "--max_steps", "1", *FULL]
     subprocess.run([sys.executable, *common, "--accum", "2", "--out", str(tmp_path / "one")], check=True, capture_output=True)
-    subprocess.run([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2", *common, "--accum", "1", "--out", str(tmp_path / "two")], check=True, capture_output=True)
+    subprocess.run([sys.executable, "-m", "torch.distributed.run", *LOCAL_RENDEZVOUS, "--nproc_per_node=2", *common, "--accum", "1", "--out", str(tmp_path / "two")], check=True, capture_output=True)
     one, two = load_file(tmp_path / "one/model.safetensors"), load_file(tmp_path / "two/model.safetensors")
     assert one.keys() == two.keys() and all(torch.equal(one[k], two[k]) for k in one)
 
@@ -489,7 +555,169 @@ def test_full_ft_plumbing():
             validated_trial({"base": "b", **bad}, manifest)
     assert trial_resources("H200", True)[1][0] >= 12 * 25.6e9 / 2 ** 20 and trial_resources("H200:8", True) != trial_resources("H200", True)
     assert compute_bound("H200:8", 3600, 1) == pytest.approx(compute_bound("H200", 3600, 1) + 7 * GPU_HOURLY["H200"])
+    from kev.budget import FULL_FT_RETRIES, MAX_BUDGET, MAX_TIMEOUT, hourly_rate
+    assert compute_bound("H200:8", 3600, 2, True) == pytest.approx(hourly_rate("H200:8", True) * 2 * (1 + FULL_FT_RETRIES))   # every attempt counted
+    assert MAX_TIMEOUT[True] == 86400 and compute_bound("H200:8", 28800, 1, True) <= MAX_BUDGET[True]   # an 8 x H200 day: three 8 h attempts
+    assert validated_trial({"base": "b", "full_ft": 1, "weights_dtype": "bf16", "shared_prefix": 0}, manifest)["shared_prefix"] == 0
     assert [rank_share(list(range(5)), r, 2) for r in (0, 1)] == [[0, 2, 4], [1, 3, 0]] and rank_share([1, 2], 0, 1) == [1, 2]
-    from kev.train import length_sorted_steps
-    reqs = [{"state": "s" * n, "questions": {"q": {}}} for n in (1, 9, 5, 7, 3)]
-    assert [len(r["state"]) for r in length_sorted_steps(reqs, 2)] == [9, 1, 7, 5, 3]   # same records per step, longest first
+    from kev.train import microbatch_plan
+    reqs = [{"state": "s" * n, "questions": {"q": {"instr": "x"}}} for n in (1, 90, 5, 70, 3, 80, 2, 4, 6, 7)]
+    knobs = lambda sort: SimpleNamespace(batch=2, accum=2, length_sort=sort, shared_prefix=1)
+    plain = [microbatch_plan(reqs, knobs(0), 2, rank) for rank in (0, 1)]
+    assert [len(c) for c, _, _ in plain[0]] == [2, 2, 1] and [(n, ends) for _, n, ends in plain[0]] == [(8, False), (8, True), (2, True)]
+    balanced = [microbatch_plan(reqs, knobs(1), 2, rank) for rank in (0, 1)]
+    assert len(balanced[0]) == len(balanced[1]) == 3 and [ends for _, _, ends in balanced[0]] == [False, True, True]
+    first = sorted(len(r["state"]) for plan in balanced for c, _, _ in plan[:2] for r in c)
+    assert first == sorted(len(r["state"]) for r in reqs[:8])   # the first step holds its own 8 records, once each
+    alone = {len(c[0]["state"]) for plan in balanced for c, _, _ in plan[:2] if len(c) == 1}
+    assert {90, 80, 70} <= alone   # a long record gets a micro-batch to itself; the short ones share one
+
+
+def test_continue_trial_only_continues_the_same_full_weight_run(tmp_path, monkeypatch):
+    """kev.experiment.continue_trial (a Modal retry after a timeout, or modal_app.py::resume) retrains with the trial's own
+    config, which kev.train continues from its resume point, and scores it; it refuses a LoRA trial, a finished one and
+    one whose code changed."""
+    import kev.experiment as E
+    from kev.suite import read_json, write_json
+    sources, trial, calls = E.source_hashes(), tmp_path / "00-trial-0", []
+    monkeypatch.setattr(E, "train_checkpoint", lambda config, suite, output, device: calls.append(config) or str(output / "checkpoint"))
+    monkeypatch.setattr(E, "score_trial", lambda run, suite, output, *args, **kwargs: ({"run": run}, []))
+    trial.mkdir()
+    write_json(trial / "provenance.json", {"config": {"full_ft": 1, "weights_dtype": "bf16"}, "source_hashes": sources})
+    assert E.continue_trial("suite", trial, sources, "cuda")[0] == {"run": str(trial / "checkpoint")} and calls == [{"full_ft": 1, "weights_dtype": "bf16"}]
+    assert len(read_json(trial / "provenance.json")["continued"]) == 1
+    with pytest.raises(ValueError):
+        E.continue_trial("suite", trial, {**sources, "kev/train.py": "0"}, "cuda")
+    write_json(trial / "provenance.json", {"config": {"lora": 16}, "source_hashes": sources})
+    with pytest.raises(ValueError):
+        E.continue_trial("suite", trial, sources, "cuda")
+
+
+def test_resume_writer_keeps_a_later_point_being_written(tmp_path):
+    """Rank 0 finishes a point after the other ranks have started the next one (a background write outlasting the
+    interval): it removes only earlier points, never the one in progress."""
+    from kev.full_ft import LATEST, ResumeWriter
+    from kev.suite import read_json
+    for step in (1, 9): (tmp_path / f"step-{step:07d}").mkdir()
+    writer = ResumeWriter(tmp_path, background=False)
+    writer._write_point(5, {"optimizer": {}}, {"world": 1})
+    assert sorted(p.name for p in tmp_path.glob("step-*")) == ["step-0000005", "step-0000009"] and read_json(tmp_path / LATEST)["dir"] == "step-0000005"
+
+
+def _parse_train(monkeypatch, *args):
+    import sys
+    from kev import train
+    monkeypatch.setattr(sys, "argv", ["kev.train", "--out", "/nonexistent/kev-test-run", *args])
+    return train.parse_args()
+
+
+def test_row_budget_refuses_split_loss_terms(monkeypatch, capsys):
+    """--row_budget splits a record's questions into parts that each carry their share of its mean question loss; the
+    permutation KL and the anchor KL are per record (the anchor over its anchored questions), so both are refused with
+    it. --shared_prefix changes only how the logits are computed (the same nested logits per record), not a term."""
+    for extra in (("--perm_kl", "0.1"), ("--anchor", "anchors.json", "--anchor_w", "0.1")):
+        with pytest.raises(SystemExit):
+            _parse_train(monkeypatch, "--row_budget", "8192", *extra)
+        assert "--row_budget splits micro-batches" in capsys.readouterr().err
+    assert _parse_train(monkeypatch, "--row_budget", "8192").row_budget == 8192
+
+
+def test_full_ft_refuses_old_torch(monkeypatch, capsys):
+    """kev.full_ft needs torch >= 2.8 (FSDPModule.set_gradient_divide_factor) while pyproject allows 2.6: --full_ft 1
+    stops at argument parsing with the reason."""
+    import kev.full_ft as F
+    assert F.unsupported_torch("2.8.0+cu128") is None and F.unsupported_torch("2.10.1") is None
+    assert "torch >= 2.8" in F.unsupported_torch("2.7.1+cu126") and "2.6.0" in F.unsupported_torch("2.6.0")
+    monkeypatch.setattr(F, "unsupported_torch", lambda: "--full_ft 1 needs torch >= 2.8 (test)")
+    with pytest.raises(SystemExit):
+        _parse_train(monkeypatch, "--full_ft", "1", "--weights_dtype", "bf16")
+    assert "needs torch >= 2.8" in capsys.readouterr().err
+
+
+def test_padding_repeats_shuffled_order_not_the_longest():
+    """Filling every rank to the same count repeats the first records of the shuffled order: in rank_share (plain) and in
+    microbatch_plan's short last step (--length_sort 1, padded before its records are sorted by length)."""
+    from kev.full_ft import rank_share
+    from kev.train import microbatch_plan
+    assert rank_share([5, 1, 9], 1, 2) == [1, 5]
+    reqs = [{"state": "s" * n, "questions": {"q": {"instr": "x"}}} for n in (50, 60, 70, 80, 3, 900, 800)]   # last step: 3, 900, 800
+    plans = [microbatch_plan(reqs, SimpleNamespace(batch=1, accum=2, length_sort=1, shared_prefix=1), 2, rank) for rank in (0, 1)]
+    last = sorted(len(r["state"]) for plan in plans for c, _, _ in plan[2:] for r in c)
+    assert last == [3, 3, 800, 900]   # the shuffled first (the shortest here) is repeated, not the longest
+
+
+def test_grad_norm_in_training_metrics(tiny_base, tmp_path, monkeypatch):
+    """training_metrics.json carries, per epoch, the mean and max global gradient norm before clipping and the number of
+    clipped steps, for LoRA (clip_grad_norm_) and full weights (MasterAdamW's own norm)."""
+    from kev.suite import read_json
+    for name, args in (("lora", ("--lora", "4")), ("full", FULL)):
+        train_tiny(tiny_base, tmp_path / name, *args, "--accum", "1", "--epochs", "2", monkeypatch=monkeypatch)
+        metrics = read_json(tmp_path / name / "training_metrics.json")
+        norms = metrics["grad_norm"]
+        assert [e["epoch"] for e in norms] == [0, 1] and sum(e["steps"] for e in norms) == metrics["optimizer_steps"]
+        assert all(0 < e["mean"] <= e["max"] and 0 <= e["clipped_steps"] <= e["steps"] for e in norms)
+
+
+def test_continue_trial_scores_a_finished_checkpoint_without_training(tmp_path, monkeypatch):
+    """An attempt that ran out of time while scoring left a finished checkpoint (head.pt): the next attempt scores it
+    and does not train again (kev.train --resume 1 would find no resume point and start over)."""
+    import kev.experiment as E
+    from kev.suite import write_json
+    sources, trial = E.source_hashes(), tmp_path / "00-trial-0"
+    (trial / "checkpoint").mkdir(parents=True); (trial / "checkpoint" / "head.pt").write_bytes(b"")
+    write_json(trial / "provenance.json", {"config": {"full_ft": 1, "weights_dtype": "bf16"}, "source_hashes": sources})
+    monkeypatch.setattr(E, "train_checkpoint", lambda *args: pytest.fail("trained again"))
+    monkeypatch.setattr(E, "score_trial", lambda run, *args, **kwargs: ({"run": run}, []))
+    assert E.continue_trial("suite", trial, sources, "cuda")[0] == {"run": str(trial / "checkpoint")}
+
+
+def test_resume_writer_bounds_the_wait_for_peers(tmp_path, monkeypatch):
+    """Rank 0 waits PEER_WAIT for the other ranks' files, then fails loudly instead of hanging; latest.json is untouched."""
+    import kev.full_ft as F
+    monkeypatch.setattr(F, "PEER_WAIT", 0)
+    writer = F.ResumeWriter(tmp_path, background=False)
+    writer.world = 2   # a peer that never writes
+    with pytest.raises(TimeoutError, match=r"rank\(s\) \[1\]"):
+        writer._write_point(3, {"optimizer": {}}, {"world": 2})
+    assert not (tmp_path / F.LATEST).exists()
+
+
+def test_full_weight_trial_failures_are_returned_and_seen(tmp_path, monkeypatch):
+    """A full-weight trial that fails with an error returns {"failed": ...} (Modal retries only what raises, and its
+    retries are for timeouts); kev.rounds.poll_modal raises TrialFailed for it, so the watcher marks it failed."""
+    import types
+    import modal
+    import modal_app
+    from kev import rounds
+    from kev.suite import write_json
+    write_json(tmp_path / "failed.json", {"error": "ValueError: boom"})
+    result = modal_app.failed_trial("trial-0", tmp_path)
+    assert result == {"label": "trial-0", "failed": "ValueError: boom"}
+    monkeypatch.setattr(modal.FunctionCall, "from_id", lambda call_id: types.SimpleNamespace(get=lambda timeout: result))
+    with pytest.raises(rounds.TrialFailed, match="boom"):
+        rounds.poll_modal("fc-x")
+    monkeypatch.setattr(modal.FunctionCall, "from_id", lambda call_id: types.SimpleNamespace(get=lambda timeout: {"label": "trial-0", "objective": 1.0}))
+    assert rounds.poll_modal("fc-x") == "done"
+
+
+def test_resume_points_are_committed_as_they_complete(tmp_path, monkeypatch, capsys):
+    """While a full-weight trial trains, modal_app commits the runs volume after each completed resume point (a timeout
+    skips trial()'s finally); a failed commit is printed loudly and tried again."""
+    import threading
+    import modal_app
+    from kev.suite import write_json
+    commits = []
+    def commit():
+        commits.append(len(commits))
+        if len(commits) == 1: raise RuntimeError("volume busy")
+    monkeypatch.setattr(modal_app, "runs_volume", SimpleNamespace(commit=commit))
+    monkeypatch.setattr(modal_app, "RESUME_COMMIT_POLL", 0.05)
+    stop = threading.Event()
+    thread = threading.Thread(target=modal_app.commit_resume_points, args=(tmp_path, stop)); thread.start()
+    write_json(tmp_path / "latest.json", {"dir": "step-0000005", "step": 5})
+    for _ in range(100):
+        if len(commits) >= 2: break
+        threading.Event().wait(0.05)
+    stop.set(); thread.join()
+    out = capsys.readouterr().out
+    assert len(commits) == 2 and "resume point 5 NOT committed" in out and "committed resume point 5 (step-0000005)" in out
