@@ -1,9 +1,9 @@
 """An image as the start of the state, on the base's own vision tower.
 
-Kev's bases (Qwen3.5-*-Base) are vision-language models, but DecisionModel loads only their text backbone. The adapter
-and the pointer head live entirely in that backbone, so they apply unchanged to the same module inside the full model.
-VisionDecisionModel loads the full model (AutoModel: vision tower + language model, no vocab head) and puts the image
-tokens right after the <state> delimiter:
+Kev's bases (Qwen3.5-*-Base, and Qwen3.8-27B under Kev-27B) are vision-language models, but DecisionModel loads only
+their text backbone. The adapter and the pointer head live entirely in that backbone, so they apply unchanged to the same
+module inside the full model. VisionDecisionModel loads the full model (AutoModel: vision tower + language model, no vocab
+head) and puts the image tokens right after the <state> delimiter:
 
     <state> <vision_start> <image_pad> x N <vision_end> state text <q> ... <opt> ... </opt> ... <decide>
 
@@ -18,10 +18,12 @@ takes DecisionModel's path unchanged.
     probs = m.probs(enc)                            # one tensor per question
 
 No checkpoint was trained with images: this reuses the base's image understanding through an adapter that only saw text,
-and the temperature in head.pt was fitted on text states. An image becomes about pixels / 1,024 tokens (each side rounded
-to a multiple of 32; at least 64, the processor scales small pictures up) on top of max_state. `m.processor.size`
-({"shortest_edge", "longest_edge"} in total pixels) sets the bounds, capped here at MAX_IMAGE_PIXELS. The image processor
-is transformers' Pillow backend, so it needs Pillow and not torchvision, and it does not apply EXIF orientation.
+and the temperature in head.pt was fitted on text states. scripts/vision_parity.py has checked Kev-0.8B and Kev-4B;
+Kev-27B (trained on a bf16 backbone, so it loads bf16 with the adapter unmerged here) has not been run with images. An
+image becomes about pixels / 1,024 tokens (each side rounded to a multiple of 32; at least 64, the processor scales small
+pictures up) on top of max_state. `m.processor.size` ({"shortest_edge", "longest_edge"} in total pixels) sets the bounds,
+capped here at MAX_IMAGE_PIXELS. The image processor is transformers' Pillow backend, so it needs Pillow and not
+torchvision, and it does not apply EXIF orientation.
 """
 import torch
 from transformers import AutoModel

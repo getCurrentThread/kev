@@ -42,7 +42,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="jaredpalmer/kev-0.8b")
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--bf16", action="store_true", help="LoadOptions(dtype=bf16, merge=False) instead of the exact fp32 path")
+    ap.add_argument("--bf16", action="store_true", help="LoadOptions(dtype=bf16, merge=False) instead of LoadOptions() (fp32 merged, "
+                    "except for checkpoints trained on a bf16 backbone, such as Kev-27B, which load bf16 unmerged either way)")
     ap.add_argument("--suite", help="also compare the text path on this frozen suite's development records (e.g. evals/smoke-v1)")
     a = ap.parse_args()
     opts = LoadOptions(dtype=torch.bfloat16, merge=False) if a.bf16 else LoadOptions()
@@ -73,7 +74,7 @@ def main():
                     dz = max(dz, (z - ref).abs().max().item())
                     dp = max(dp, (z.softmax(-1) - ref.softmax(-1)).abs().max().item())
                     flips += int(z.argmax() != ref.argmax()); rows += 1
-    path = "bf16, adapter unmerged" if a.bf16 else "fp32, adapter merged"
+    path = f"{m.dtype}, adapter {'unmerged' if hasattr(m.lm, 'peft_config') else 'merged'}"   # what loaded, not what was asked
     n_suite = len(texts) - len(RECORDS)
     print(f"{a.run} on {a.device} ({path})")
     print(f"  text, load vs load_vision: max |dp| {text_dp:.2g}, {text_flips} argmax flips "

@@ -280,7 +280,7 @@ Asking questions together or separately produces probabilities within 4e-6 in th
 
 ### Images
 
-The Qwen3.5 bases are vision-language models, and a checkpoint's adapter only touches their language model. `Checkpoint.load_vision` loads the base with its vision tower, so the state can start with a picture (the image processor needs Pillow, which `uv sync` installs; with pip, `pip install pillow`):
+The Qwen3.5 and Qwen3.8 bases are vision-language models, and a checkpoint's adapter only touches their language model. `Checkpoint.load_vision` loads the base with its vision tower, so the state can start with a picture (the image processor needs Pillow, which `uv sync` installs; with pip, `pip install pillow`):
 
 ```python
 from PIL import Image, ImageOps
