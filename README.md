@@ -278,6 +278,24 @@ Training uses cross-entropy on the correct answer. The adapter and head are trai
 
 Asking questions together or separately produces probabilities within 4e-6 in the fp32 tests. This does **not** mean option order is irrelevant: options within a question can still affect one another. See [the model code](kev/model.py) and [parity tests](tests/test_model.py).
 
+### Images
+
+The Qwen3.5 and Qwen3.8 bases are vision-language models, and a checkpoint's adapter only touches their language model. `Checkpoint.load_vision` loads the base with its vision tower, so the state can start with a picture (the image processor needs Pillow, which `uv sync` installs; with pip, `pip install pillow`):
+
+```python
+from PIL import Image, ImageOps
+from kev.checkpoint import Checkpoint
+from kev.model import SERVE_MAX_BRANCH, SERVE_MAX_STATE
+
+tok, model = Checkpoint("jaredpalmer/kev-4b").load_vision("cuda")
+record = {"state": "", "questions": [{"instr": "Which room is this?", "options": ["kitchen", "bedroom", "office"], "label": 0}]}
+image = ImageOps.exif_transpose(Image.open("room.jpg"))   # phone photos store their rotation in EXIF
+enc = model.encode(tok, record, image=image, max_state=SERVE_MAX_STATE, max_branch=SERVE_MAX_BRANCH)
+print(model.probs(enc)[0])
+```
+
+A picture becomes about one token per 1,024 pixels, at least 64 and at most 1,024 (`kev.vision.MAX_IMAGE_PIXELS`), on top of the state text. No Kev checkpoint was trained on images, and the temperature each checkpoint carries was fitted on text, so check accuracy and confidence on your own data. It runs in Python only: the server, the prefix cache and the MLX backend don't take images.
+
 ## Training
 
 The released models share one base training set, `decision-v7`: 10,000 examples from ten public datasets, 896 generated policy examples, and 1,680 examples from 60 generated rule structures. Kev-0.8B, 4B and 9B train on it for two epochs with LoRA rank 16 and cross-entropy. The learning rate is `1e-4` for 0.8B and `5e-5` for 4B and 9B. On these hybrid bases the adapter covers the attention, MLP and DeltaNet projections; `kev.train` picks the right targets from the model config.

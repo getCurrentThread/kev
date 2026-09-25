@@ -1,7 +1,7 @@
 """Numerical parity of the model's serving paths, on real weights: merged vs unmerged LoRA, prefix cache vs full pass,
-shape-bucket padding, row form vs packed mask, hybrid isolation, and the --init_from warm start end to end.
-Needs the smoke checkpoint (runs/smoke-hl/00-trial-0/checkpoint) and downloads Qwen/Qwen2.5-0.5B (the hybrid test also
-Qwen/Qwen3.5-0.8B-Base); not run in CI.
+shape-bucket padding, row form vs packed mask, hybrid isolation, images in the state (kev.vision), and the --init_from
+warm start end to end. Needs the smoke checkpoint (runs/smoke-hl/00-trial-0/checkpoint) and downloads Qwen/Qwen2.5-0.5B
+(the hybrid and vision tests also Qwen/Qwen3.5-0.8B-Base, and jaredpalmer/kev-0.8b); not run in CI.
 Run: uv run --extra serve python -m pytest tests/test_model.py -q
 """
 import os
@@ -210,6 +210,69 @@ def test_shared_prefix_matches_rows(device, dtype):
     assert abs(along(g_prefix)) <= max(1e-4, 3 * abs(along(g_alone)), 0.3 * noise[1])
 
 
+SUPPORT = {"state": "Order 4411 arrived late and the box was crushed. Two charges appear on the card.",
+           "questions": [{"instr": "Is there a billing problem?", "options": ["yes", "no"], "label": 0},
+                         {"instr": "Which team should handle this?", "options": ["returns", "shipping", "billing", "other"], "label": 2}]}
+
+
+def picture():
+    """A small synthetic RGB image (no download); the processor scales it up to its minimum pixel count."""
+    import numpy as np
+    from PIL import Image
+    y, x = np.mgrid[0:96, 0:128]
+    return Image.fromarray(np.stack([2 * x, 2 * y, x + y], -1).astype("uint8"))
+
+
+def test_vision_load_without_an_image_matches_load():
+    """load_vision puts the released Kev-0.8B adapter on the language model inside Qwen3.5-0.8B-Base's vision-language
+    model. That is the module load() builds on its own, so a record without an image must score the same."""
+    import torch
+    from kev.checkpoint import Checkpoint, LoadOptions
+    ck = Checkpoint("jaredpalmer/kev-0.8b")
+    tok, text = ck.load("cpu"); _, vision = ck.load_vision("cpu")
+    with torch.no_grad():
+        a, b = torch.cat(text.probs(text.encode(tok, SUPPORT))), torch.cat(vision.probs(vision.encode(tok, SUPPORT)))
+    assert (a - b).abs().max() < 1e-5, (a, b)
+    for opts in (LoadOptions(backend="mlx"), LoadOptions(cuda_graphs=True), LoadOptions(fused=True)):
+        with pytest.raises(ValueError):                       # images run the eager torch path; refused, not silently dropped
+            ck.load_vision("cpu", opts)
+
+
+def test_vision_rows_match_the_base_forward_and_stay_isolated(monkeypatch):
+    """The image path (vision tower once per record, features scattered into each row, M-RoPE positions) must equal the
+    base's own multimodal forward on the same row; questions stay isolated (together = alone) and one row per pass
+    changes nothing. Qwen3.5-0.8B-Base with an untrained head; slow reference kernels on CPU."""
+    import torch
+    import kev.model as M
+    from kev.model import load_tokenizer, rows_of
+    from kev.vision import VisionDecisionModel
+    tok = load_tokenizer("Qwen/Qwen3.5-0.8B-Base"); torch.manual_seed(0)
+    m = VisionDecisionModel("Qwen/Qwen3.5-0.8B-Base", tok, "cpu").eval()
+    enc = m.encode(tok, SUPPORT, image=picture())
+    S, _, rows = rows_of(enc)
+    with torch.no_grad():
+        together = m.forward(enc)
+        for z, r in zip(together, rows):
+            ids = torch.tensor([S + r["ids"]])
+            h = m.vlm(input_ids=ids, pixel_values=enc["pixel_values"], image_grid_thw=enc["image_grid_thw"],
+                      mm_token_type_ids=(ids == m.image_pad).int()).last_hidden_state[0].float()
+            reference = m.head(h[len(S) + r["decide"]], h[torch.tensor([len(S) + o for o in r["opts"]])])
+            assert (z - reference).abs().max() < 1e-4, (z, reference)
+        alone = [m.forward(m.encode(tok, {**SUPPORT, "questions": [q]}, image=picture()))[0] for q in SUPPORT["questions"]]
+        monkeypatch.setattr(M, "rows_per_pass", lambda rows, prefix_len=0, budget=0: 1)
+        one_row_per_pass = m.forward(enc)
+        text_only = m.forward(m.encode(tok, SUPPORT))
+    for a, b, c in zip(together, alone, one_row_per_pass):
+        assert (a - b).abs().max() < 1e-4 and (a - c).abs().max() < 1e-4
+    assert any((a - t).abs().max() > 1e-3 for a, t in zip(together, text_only)), "the image must reach the rows"
+    with pytest.raises(NotImplementedError):
+        m.probs_and_prefix(enc)
+    with pytest.raises(NotImplementedError):                  # kev.shared_prefix runs token ids: it would drop the image
+        m.forward_batch([enc], True)
+    with pytest.raises(ValueError):
+        m.encode(tok, SUPPORT, image=[picture(), picture()])
+
+
 def test_cuda_graphs_match_eager():
     """kev.cuda_graphs + kev.fused_qwen35 (CUDA only): the served path (probs_batch) gives the eager bf16 answers up to
     bf16 noise, first with its new buckets run eagerly and then replayed, for new states (two sharing one) and cached
@@ -241,6 +304,7 @@ def test_cuda_graphs_match_eager():
             assert p is not None and c is p or c is eager_prefix
             assert all((a - b).abs().max() < 0.05 for a, b in zip(ref, ps)) and all((a - b).abs().max() < 0.05 for a, b in zip(ref, hs))
     assert graphs.captures > 0 and not graphs.pending
+
 
 def test_init_from_warm_start_and_compatibility_checks(tmp_path):
     """PR #9: --init_from loads an existing adapter + pointer head before training and refuses incompatible sources.

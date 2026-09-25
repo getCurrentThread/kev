@@ -223,7 +223,7 @@ class DecisionModel(nn.Module):
         # dtype: fp32 for training and exact evaluation; bf16 is a serving option for large backbones (8B on a 32 GB Mac)
         load = {"dtype": dtype, "attn_implementation": attn}
         if direct_load: load["device_map"] = {"": torch.cuda.current_device() if device == "cuda" else device}   # "cuda": under torchrun, this rank's GPU
-        self.lm = AutoModel.from_pretrained(weights, **load) if weights else AutoModelForCausalLM.from_pretrained(name, revision=revision, **load).model
+        self.lm = AutoModel.from_pretrained(weights, **load) if weights else self.backbone(name, revision=revision, **load)
         self.pad_id = pad_id(tok)
         # hybrid backbones (Qwen3.5: Gated DeltaNet layers, recurrent) cannot honour the block-causal mask, so every
         # question runs as its own causal row continuing from the state (rows_of). Attention-only backbones keep the
@@ -248,6 +248,11 @@ class DecisionModel(nn.Module):
 
     backend = "torch"           # kev.mlx_model.MLXDecisionModel is the other implementation of this scoring interface
     graphs = None               # kev.cuda_graphs.CudaGraphs for the serving passes of a hybrid backbone on CUDA (LoadOptions.cuda_graphs)
+
+    def backbone(self, name, **kw):
+        """The text backbone the adapter is trained on. kev.vision.VisionDecisionModel returns the same module from inside
+        the base's vision-language model."""
+        return AutoModelForCausalLM.from_pretrained(name, **kw).model
 
     @property
     def prefix_min_tokens(self):
@@ -301,16 +306,19 @@ class DecisionModel(nn.Module):
         bound with the number of questions). The two forms agree (tests/test_model.py::test_rows_match_packed)."""
         return self.hybrid or any(len(e["ids"]) > SERVE_MAX_PACKED for e in encs)
 
-    def _rows_hidden(self, rows, cache=None, prefix_len=0):
+    def _rows_hidden(self, rows, cache=None, prefix_len=0, inputs=None):
         """Hidden states of causal token rows, one [L_i, d] tensor per row. In eval mode the rows go through the backbone
         rows_per_pass at a time; training keeps one batch (its batches are small and autograd needs the whole graph anyway).
         With `cache`, the rows are branches continuing the cached state: in eager mode the cache is replicated once per
-        chunk, leaving the caller's prefix pristine, and the cached tokens are marked real in the attention mask."""
+        chunk, leaving the caller's prefix pristine, and the cached tokens are marked real in the attention mask.
+        `inputs(ids, att)` replaces input_ids + positions with other backbone inputs for a padded chunk (kev.vision: image
+        features in the <image_pad> slots and the base's multimodal positions)."""
         chunk = len(rows) if self.training else rows_per_pass([ids for ids, _ in rows], prefix_len)
         out = []
         for start in range(0, len(rows), chunk):
             part = rows[start:start + chunk]
             ids, pos, att = self._pad_rows(part)
+            x = {"input_ids": ids, "position_ids": pos} if inputs is None else inputs(ids, att)
             past = {}
             if cache is not None:
                 replica = copy.copy(cache)
@@ -326,7 +334,7 @@ class DecisionModel(nn.Module):
                 replica.reorder_cache(torch.zeros(len(part), dtype=torch.long, device=self.device))
                 att = torch.cat([torch.ones((len(part), prefix_len), dtype=torch.long, device=self.device), att], 1)
                 past = {"past_key_values": replica, "use_cache": True}
-            h = self.lm(input_ids=ids, position_ids=pos, attention_mask=att, **past).last_hidden_state.float()
+            h = self.lm(**x, attention_mask=att, **past).last_hidden_state.float()
             out += [h[i, : len(row_ids)] for i, (row_ids, _) in enumerate(part)]
         return out
 
