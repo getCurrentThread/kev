@@ -17,6 +17,8 @@ RULES = [
      r"torch\.(load|save)\([^\n]*head\.pt", {"kev/checkpoint.py"}),
     ("KEV_DTYPE/KEV_MERGE/KEV_ATTN/KEV_LORA_SCALE/KEV_TEMPERATURE/KEV_BACKEND/KEV_CUDA_GRAPHS are read only by LoadOptions.from_env",
      r"environ(\.get)?\(?\[?\s*\"KEV_(DTYPE|MERGE|ATTN|LORA_SCALE|TEMPERATURE|BACKEND|CUDA_GRAPHS)\"", {"kev/checkpoint.py"}),
+    ("whether a checkpoint is a LoRA adapter or full weights, and where its shards are, is kev.checkpoint.Checkpoint.full / shards (the loader rule)",
+     r"glob\(\"model\*\.safetensors\"\)|adapter_config\.json\"\)\.exists\(\)", {"kev/checkpoint.py"}),
     ("a checkpoint becomes a model only through kev.checkpoint (Checkpoint.load picks the torch or MLX implementation)",
      r"MLXDecisionModel\(|merge_lora\(", {"kev/checkpoint.py", "kev/mlx_model.py", "tests/test_mlx.py"}),
     ("option keys come from kev.api.question_keys",
@@ -36,6 +38,10 @@ RULES = [
      r"10 \* 1024 \* 1024", {"kev/suite.py"}),
     ("the pinned Qwen3.5 tokenizer suite builders admit records under is kev.suite.ADMISSION_TOKENIZER",
      r"1001bb4d826a52d1f399e183466143f4da7b741b", {"kev/suite.py", "kev/transfer_v9.py"}),   # transfer_v9 pins every Qwen3.5 base it scores
+    ("a trial's served temperature (fitted on its own development rows), clean rows served with unknowable records kept, and "
+     "the registered paired read (2,000 resamples, seed 0, micro) are kev.rounds.temperature / served_clean / paired",
+     r"development/rows\.json\"\), \[\]\)\[0\]|tempered_row\(raw_row\(recorded\(|SAMPLES = 2000|def (boot|knowable)\(|knowable = lambda",
+     {"kev/rounds.py", "kev/metrics.py"}),   # kev.metrics.served_at is the scored-rows form the helpers build on
     ("a state's normalised-text hash (text_sha256) is kev.suite.text_digest",
      r"\.casefold\(\)\.split\(\)\)\.encode\(\)", {"kev/suite.py", "kev/data.py"}),   # kev.suite imports kev.data, so kev.data keeps its inline copy
 ]

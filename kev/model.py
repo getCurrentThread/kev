@@ -3,7 +3,7 @@ import copy, math, os, re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from transformers.cache_utils import LinearAttentionCacheLayerMixin
 
 # Reuse existing rarely-used Qwen special tokens as delimiters (state, q, opt, /opt, decide) so no
@@ -198,6 +198,10 @@ SCORING_INTERFACE = ("encode", "forward", "probs", "probs_and_prefix", "probs_wi
                      "head", "backend", "dtype", "device", "hybrid", "option_isolation", "prefix_min_tokens")
 
 
+EAGER_STATES = 4   # long new states (past the graphed state pass) whose eager prefixes one batched run holds at once: each
+                   # holds its state's keys, values and DeltaNet states (~0.3 GB for 2,200 tokens on Kev-27B)
+
+
 def probs_one(model, enc, prefix, keep):
     """-> (probs, prefix to keep) for one request, on any backend: the question rows on the cached prefix on a hit, one
     pass that also returns the prefix when it is to be kept, the plain pass otherwise."""
@@ -206,13 +210,20 @@ def probs_one(model, enc, prefix, keep):
 
 
 class DecisionModel(nn.Module):
-    def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, special_embeddings=False, lora_targets="all", dtype=torch.float32):
+    def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, special_embeddings=False, lora_targets="all", dtype=torch.float32,
+                 weights=None, direct_load=False):
+        """weights: a full-weight checkpoint directory whose saved backbone replaces the base's (kev.checkpoint's loader rule).
+        direct_load: load the backbone straight onto `device` (transformers device_map) instead of staging it in host memory;
+        full-weight training on several GPUs in one container needs it (N processes x a 51 GB checkpoint otherwise). Off by
+        default: it changes where the rotary buffers are computed, so every other path keeps its bits."""
         super().__init__()
         # backbone only (no vocab head): we never generate text.
         # eager on MPS/CPU (known-good with our float 4D mask); SDPA on CUDA (accepts arbitrary additive masks).
         attn = attn or ("sdpa" if str(device).startswith("cuda") else "eager")
         # dtype: fp32 for training and exact evaluation; bf16 is a serving option for large backbones (8B on a 32 GB Mac)
-        self.lm = self.backbone(name, revision=revision, dtype=dtype, attn_implementation=attn)
+        load = {"dtype": dtype, "attn_implementation": attn}
+        if direct_load: load["device_map"] = {"": torch.cuda.current_device() if device == "cuda" else device}   # "cuda": under torchrun, this rank's GPU
+        self.lm = AutoModel.from_pretrained(weights, **load) if weights else self.backbone(name, revision=revision, **load)
         self.pad_id = pad_id(tok)
         # hybrid backbones (Qwen3.5: Gated DeltaNet layers, recurrent) cannot honour the block-causal mask, so every
         # question runs as its own causal row continuing from the state (rows_of). Attention-only backbones keep the
@@ -419,23 +430,27 @@ class DecisionModel(nn.Module):
         kept, else None). With CUDA graphs the requests the graphed passes admit run together (kev.cuda_graphs: shared
         state and row passes; a state too long for the graphed state pass gets its own eager pass first); the rest, and
         every other backend, one at a time. Rows are independent, so a request's answers do not depend on the batch."""
-        splits, pre = [rows_of(e) for e in encs], list(prefixes)   # pre: the cached prefixes plus eager ones made below
+        splits = [rows_of(e) for e in encs]
         def fits(i, cached):
             S, _, rows = splits[i]
             return self.graphs is not None and self.graphs.admits(len(S), [len(r["ids"]) for r in rows], cached)
-        for i in range(len(encs)):
-            if pre[i] is None and not fits(i, False) and fits(i, True): pre[i] = self.prefix(encs[i])
-        batched = [i for i in range(len(encs)) if fits(i, pre[i] is not None)]
-        out = {i: probs_one(self, encs[i], pre[i], keep[i]) for i in sorted(set(range(len(encs))) - set(batched))}
-        if batched:
-            from .cuda_graphs import Request   # here, not at the top: the HF Space vendors model.py without cuda_graphs.py
-            questions = [r for i in batched for r in splits[i][2]]   # per question its picks: the <decide> position, then its options
+        long = {i for i in range(len(encs)) if prefixes[i] is None and not fits(i, False) and fits(i, True)}
+        batched = [i for i in range(len(encs)) if i in long or fits(i, prefixes[i] is not None)]
+        out = {i: probs_one(self, encs[i], prefixes[i], keep[i]) for i in sorted(set(range(len(encs))) - set(batched))}
+        runs, held = [[]], 0   # graphed runs, each holding at most EAGER_STATES long states' eager prefixes at once
+        for i in batched:
+            if i in long and held == EAGER_STATES: runs.append([]); held = 0
+            runs[-1].append(i); held += i in long
+        from .cuda_graphs import Request   # here, not at the top: the HF Space vendors model.py without cuda_graphs.py
+        for run in filter(None, runs):
+            pre = {i: self.prefix(encs[i]) if i in long else prefixes[i] for i in run}
             X, caches = self.graphs.run([Request(splits[i][0], splits[i][1], [(r["ids"], r["pos"]) for r in splits[i][2]],
                                                  None if pre[i] is None else pre[i][1], keep[i], [[r["decide"], *r["opts"]] for r in splits[i][2]])
-                                         for i in batched])
-            ps = iter(self._readout_many(X, [len(r["opts"]) for r in questions]))
-            for i, cache in zip(batched, caches):
-                out[i] = [next(ps) for _ in splits[i][2]], pre[i] or (None if cache is None else (len(splits[i][0]), cache, None))
+                                         for i in run])   # per question its picks: the <decide> position, then its options
+            ps = iter(self._readout_many(X, [len(r["opts"]) for i in run for r in splits[i][2]]))
+            for i, cache in zip(run, caches):
+                made = pre[i] if i in long else None if cache is None else (len(splits[i][0]), cache, None)
+                out[i] = [next(ps) for _ in splits[i][2]], prefixes[i] or (made if keep[i] else None)
         return [out[i][0] for i in range(len(encs))], [out[i][1] for i in range(len(encs))]
 
     def _readout_many(self, X, ks):
